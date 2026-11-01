@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   ArrowUpRight,
   Bike,
@@ -32,13 +32,56 @@ const revenueTrend = [
   { label: 'Oct', value: 35400 },
 ]
 
+function createSampleArrivals(vehicles, customers, staff) {
+  const samples = [
+    { bookingId: 'BK-3985', vehicleId: 'VH-1042', customerId: 'CU-2048', staffId: 'ST-024', minutesFromNow: 35, pickupLocation: 'WavyGo Ahmedabad Hub', returnLocation: 'Ahmedabad Airport' },
+    { bookingId: 'BK-3986', vehicleId: 'VH-1038', customerId: 'CU-2047', staffId: 'ST-023', minutesFromNow: 95, pickupLocation: 'Satellite Road Hub', returnLocation: 'Prahlad Nagar' },
+    { bookingId: 'BK-3987', vehicleId: 'VH-1034', customerId: 'CU-2046', staffId: 'ST-022', minutesFromNow: 180, pickupLocation: 'Navrangpura Hub', returnLocation: 'Ahmedabad Railway Station' },
+  ]
+
+  return samples.map((sample) => ({
+    ...sample,
+    vehicle: vehicles.find((vehicle) => vehicle.id === sample.vehicleId),
+    customer: customers.find((customer) => customer.id === sample.customerId),
+    staff: staff.find((person) => person.id === sample.staffId),
+    expectedAt: Date.now() + sample.minutesFromNow * 60_000,
+    status: 'Upcoming',
+  }))
+}
+
+function formatArrivalCountdown(arrival, now) {
+  if (arrival.status === 'Arrived') return 'Marked as arrived'
+  const difference = arrival.expectedAt - now
+  const minutes = Math.ceil(Math.abs(difference) / 60_000)
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  const duration = hours ? `${hours}h ${remainingMinutes}m` : `${remainingMinutes}m`
+  return difference < 0 ? `Delayed by ${duration}` : `In ${duration}`
+}
+
 function Dashboard() {
-  const { bookings, vehicles } = useDemoData()
+  const { bookings, vehicles, customers, staff } = useDemoData()
   const [dateRange, setDateRange] = useState('Last 30 days')
+  const [arrivalFilter, setArrivalFilter] = useState('All Upcoming')
+  const [arrivals, setArrivals] = useState(() => createSampleArrivals(vehicles, customers, staff))
+  const [now, setNow] = useState(() => Date.now())
   const rentedVehicles = vehicles.filter((vehicle) => vehicle.availability === 'Rented')
   const availableVehicles = vehicles.filter((vehicle) => vehicle.availability === 'Available')
   const activeBookings = bookings.filter((booking) => booking.status === 'Active')
   const monthlyRevenue = revenueTrend[revenueTrend.length - 1].value
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const arrivalWindow = arrivalFilter === 'Next 1 Hour' ? 60 : arrivalFilter === 'Next 2 Hours' ? 120 : null
+  const visibleArrivals = arrivals.filter((arrival) => {
+    if (arrival.status === 'Arrived') return false
+    if (arrivalWindow === null) return true
+    const minutesUntilArrival = (arrival.expectedAt - now) / 60_000
+    return minutesUntilArrival >= 0 && minutesUntilArrival <= arrivalWindow
+  })
 
   return (
     <div>
@@ -189,6 +232,87 @@ function Dashboard() {
           </div>
         </Card>
       </div>
+
+      <Card className="mt-4 overflow-hidden p-5 sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">Upcoming Bikes / Vehicles</h2>
+            <p className="mt-1 text-xs text-slate-500">Illustrative arrival schedule · local demo records</p>
+          </div>
+          <FilterSelect
+            label="Show"
+            value={arrivalFilter}
+            onChange={setArrivalFilter}
+            options={['Next 1 Hour', 'Next 2 Hours', 'All Upcoming']}
+          />
+        </div>
+        <div className="mt-4 space-y-3">
+          {visibleArrivals.map((arrival) => {
+            const status = arrival.status === 'Arrived'
+              ? 'Arrived'
+              : arrival.expectedAt < now ? 'Delayed' : 'Upcoming'
+            return (
+              <article key={arrival.bookingId} className="rounded-xl border border-slate-100 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-emerald-50 text-xl">
+                      {arrival.vehicle?.image || '🏍️'}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-slate-900">{arrival.vehicle?.name || 'Sample vehicle'}</p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        Vehicle ID {arrival.vehicle?.id || arrival.vehicleId} · {arrival.vehicle?.registration || 'Registration not available'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 sm:justify-end">
+                    <StatusBadge status={status} />
+                    <span className="text-xs font-medium text-slate-600">{formatArrivalCountdown(arrival, now)}</span>
+                    <Button
+                      type="button"
+                      variant={status === 'Arrived' ? 'secondary' : 'quiet'}
+                      className="min-h-8 px-2.5 text-xs"
+                      disabled={status === 'Arrived'}
+                      onClick={() => setArrivals((current) => current.map((item) =>
+                        item.bookingId === arrival.bookingId ? { ...item, status: 'Arrived' } : item,
+                      ))}
+                    >
+                      {status === 'Arrived' ? 'Arrived' : 'Mark as Arrived'}
+                    </Button>
+                  </div>
+                </div>
+                <div className="mt-3 grid gap-x-5 gap-y-2 border-t border-slate-100 pt-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                  <p><span className="text-slate-400">Booking ID</span><span className="ml-1.5 font-medium text-slate-700">{arrival.bookingId}</span></p>
+                  <p><span className="text-slate-400">Customer</span><span className="ml-1.5 font-medium text-slate-700">{arrival.customer?.name || 'Not available'}</span></p>
+                  <p><span className="text-slate-400">Contact</span><span className="ml-1.5 font-medium text-slate-700">{arrival.customer?.phone || 'Not available'}</span></p>
+                  <p><span className="text-slate-400">Expected arrival</span><span className="ml-1.5 font-medium text-slate-700">{new Date(arrival.expectedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</span></p>
+                  <p><span className="text-slate-400">Pickup location</span><span className="ml-1.5 font-medium text-slate-700">{arrival.pickupLocation}</span></p>
+                  <p><span className="text-slate-400">Return location</span><span className="ml-1.5 font-medium text-slate-700">{arrival.returnLocation}</span></p>
+                  <p><span className="text-slate-400">Assigned staff</span><span className="ml-1.5 font-medium text-slate-700">{arrival.staff?.name || 'Not assigned'}</span></p>
+                </div>
+              </article>
+            )
+          })}
+          {visibleArrivals.length === 0 && (
+            <p className="rounded-xl border border-dashed border-slate-200 px-4 py-8 text-center text-xs text-slate-500">
+              No vehicles are expected within this time window.
+            </p>
+          )}
+          {arrivalFilter === 'All Upcoming' && arrivals.some((arrival) => arrival.status === 'Arrived') && (
+            <div className="space-y-2 border-t border-slate-100 pt-3">
+              <p className="text-xs font-semibold text-slate-700">Arrived this session</p>
+              {arrivals.filter((arrival) => arrival.status === 'Arrived').map((arrival) => (
+                <div key={arrival.bookingId} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-emerald-50/60 px-3 py-2">
+                  <p className="text-xs font-medium text-slate-700">
+                    {arrival.vehicle?.name || 'Sample vehicle'} · {arrival.bookingId}
+                  </p>
+                  <StatusBadge status="Arrived" />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Card>
     </div>
   )
 }

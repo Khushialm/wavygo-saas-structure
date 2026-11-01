@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   ArrowDownToLine,
   ArrowUpRight,
@@ -13,6 +13,7 @@ import {
   Plus,
   Settings2,
   ShieldCheck,
+  Trash2,
   Upload,
   Users,
   Wallet,
@@ -439,10 +440,71 @@ function Staff() {
   const [query, setQuery] = useState('')
   const [showForm, setShowForm] = useState(false)
   const [selected, setSelected] = useState(null)
+  const [documentsByStaff, setDocumentsByStaff] = useState({})
+  const [documentTypes, setDocumentTypes] = useState({})
+  const [documentErrors, setDocumentErrors] = useState({})
+  const [previewDocument, setPreviewDocument] = useState(null)
+  const [previewUrl, setPreviewUrl] = useState('')
+
+  useEffect(() => {
+    if (!previewDocument) {
+      setPreviewUrl('')
+      return undefined
+    }
+
+    const url = URL.createObjectURL(previewDocument.file)
+    setPreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [previewDocument])
+
   const filtered = staff.filter((person) =>
     (tab === 'All' || person.status === tab)
     && `${person.name} ${person.role} ${person.phone}`.toLowerCase().includes(query.toLowerCase()),
   )
+
+  function uploadDocuments(person, event) {
+    const files = Array.from(event.target.files || [])
+    const acceptedFiles = files.filter((file) => /\.(pdf|jpe?g|png)$/i.test(file.name))
+    const rejectedFiles = files.length - acceptedFiles.length
+
+    if (rejectedFiles) {
+      setDocumentErrors((current) => ({
+        ...current,
+        [person.id]: 'Only PDF, JPG, JPEG, and PNG files are supported.',
+      }))
+    } else {
+      setDocumentErrors((current) => ({ ...current, [person.id]: '' }))
+    }
+
+    if (acceptedFiles.length) {
+      const category = documentTypes[person.id] || 'ID Proof'
+      setDocumentsByStaff((current) => ({
+        ...current,
+        [person.id]: [
+          ...(current[person.id] || []),
+          ...acceptedFiles.map((file) => ({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            name: file.name,
+            category,
+            file,
+          })),
+        ],
+      }))
+    }
+
+    event.target.value = ''
+  }
+
+  function downloadDocument(document) {
+    const url = URL.createObjectURL(document.file)
+    const link = window.document.createElement('a')
+    link.href = url
+    link.download = document.name
+    window.document.body.append(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
 
   return (
     <div>
@@ -458,6 +520,63 @@ function Staff() {
         <DataTable rows={filtered} columns={[
           { key: 'name', label: 'Team member', render: (row) => <button type="button" onClick={() => setSelected(row)} className="text-left font-medium text-slate-800 hover:text-emerald-800">{row.name}<span className="mt-1 block text-[11px] font-normal text-slate-400">{row.id}</span></button> },
           { key: 'role', label: 'Role' }, { key: 'phone', label: 'Phone' },
+          { key: 'documents', label: 'Documents', render: (row) => {
+            const documents = documentsByStaff[row.id] || []
+            return (
+              <div className="min-w-[260px] space-y-2.5">
+                <div className="flex items-center gap-2">
+                  <select
+                    aria-label={`Document type for ${row.name}`}
+                    value={documentTypes[row.id] || 'ID Proof'}
+                    onChange={(event) => setDocumentTypes((current) => ({ ...current, [row.id]: event.target.value }))}
+                    className="h-8 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-700"
+                  >
+                    {['Aadhaar Card', 'PAN Card', 'ID Proof', 'Resume', 'Joining Letter', 'Employment Contract', 'Other'].map((type) => <option key={type}>{type}</option>)}
+                  </select>
+                  <label className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50">
+                    <Upload size={13} aria-hidden="true" />
+                    Upload
+                    <input
+                      type="file"
+                      multiple
+                      accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+                      onChange={(event) => uploadDocuments(row, event)}
+                      className="sr-only"
+                    />
+                  </label>
+                </div>
+                {documentErrors[row.id] && <p role="alert" className="text-[11px] text-rose-600">{documentErrors[row.id]}</p>}
+                {documents.length ? (
+                  <div className="space-y-1.5">
+                    {documents.map((document) => (
+                      <div key={document.id} className="flex min-w-0 items-center gap-1.5 text-[11px]">
+                        <FileText size={13} className="shrink-0 text-emerald-700" aria-hidden="true" />
+                        <span className="min-w-0 flex-1 truncate text-slate-700" title={`${document.category}: ${document.name}`}>
+                          <span className="font-medium">{document.category}: </span>{document.name}
+                        </span>
+                        <button type="button" onClick={() => setPreviewDocument(document)} aria-label={`View ${document.name}`} className="font-semibold text-emerald-800 hover:text-emerald-950">View</button>
+                        <button type="button" onClick={() => downloadDocument(document)} aria-label={`Download ${document.name}`} className="font-semibold text-slate-600 hover:text-slate-900">Download</button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDocumentsByStaff((current) => ({
+                              ...current,
+                              [row.id]: (current[row.id] || []).filter((item) => item.id !== document.id),
+                            }))
+                            if (previewDocument?.id === document.id) setPreviewDocument(null)
+                          }}
+                          aria-label={`Delete ${document.name}`}
+                          className="grid size-6 shrink-0 place-items-center rounded text-slate-400 hover:bg-rose-50 hover:text-rose-700"
+                        >
+                          <Trash2 size={13} aria-hidden="true" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="text-[11px] text-slate-400">No documents uploaded</p>}
+              </div>
+            )
+          } },
           { key: 'salary', label: 'Monthly salary', render: (row) => currency(row.salary) },
           { key: 'attendance', label: 'Attendance' }, { key: 'nextSalary', label: 'Next salary' },
           { key: 'status', label: 'Status', render: (row) => <StatusBadge status={row.status} /> },
@@ -472,6 +591,15 @@ function Staff() {
         { name: 'nextSalary', label: 'Next salary date', type: 'date' },
       ]} onSave={(values) => { addRecord('staff', { ...values, salary: Number(values.salary), id: nextId('ST', staff), attendance: 'Not recorded', status: 'Active' }); setShowForm(false) }} />}
       {selected && <DetailDialog title={selected.name} record={selected} onClose={() => setSelected(null)} rows={Object.entries(selected).map(([key, value]) => [key, key === 'salary' ? currency(value) : value])} />}
+      {previewDocument && (
+        <Modal title={`${previewDocument.category} · ${previewDocument.name}`} onClose={() => setPreviewDocument(null)}>
+          {previewUrl && (previewDocument.file.type === 'application/pdf' || /\.pdf$/i.test(previewDocument.name) ? (
+            <iframe title={previewDocument.name} src={previewUrl} className="h-[65vh] w-full rounded-lg border border-slate-200" />
+          ) : (
+            <img src={previewUrl} alt={previewDocument.name} className="max-h-[65vh] w-full rounded-lg object-contain" />
+          ))}
+        </Modal>
+      )}
     </div>
   )
 }
