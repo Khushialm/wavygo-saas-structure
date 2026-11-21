@@ -33,7 +33,7 @@ def test_create_offline_booking():
         "payment": {
             "method": "Cash",
             "deposit": True,
-            "paid_amount": 1000,
+            "paid_amount": 0,
         },
         "notes": "Customer presented valid driving license.",
     }
@@ -43,7 +43,7 @@ def test_create_offline_booking():
     data = response.json()
 
     assert data["type"] == "Offline"
-    assert data["status"] == "Active"
+    assert data["status"] == "Confirmed"
     assert data["customer"] == "Ravi Kumar"
     assert data["vehicle"] == "Honda Activa 6G"
     assert data["rental_days"] == 2
@@ -58,10 +58,8 @@ def test_create_offline_booking():
     # Deposit: 2000
     # Total: 2362.9 - 100 + 2000 = 4262.9
     assert round(data["total_amount"], 1) == 4262.9
-    # Paid: 1000
-    assert data["paid"] == 1000.0
-    # Pending: 4262.9 - 1000 = 3262.9
-    assert round(data["pending"], 1) == 3262.9
+    assert data["paid"] == 0.0
+    assert round(data["pending"], 1) == 4262.9
 
 
 def test_list_and_get_offline_bookings():
@@ -83,56 +81,93 @@ def test_list_and_get_offline_bookings():
     assert len(query_res.json()) >= 1
 
 
-def test_update_status_and_payment():
-    # Create booking first
-    payload = {
-        "vehicle": {
-            "vehicle_id": "VH-1038",
-            "vehicle_name": "Royal Enfield Classic 350",
+def test_update_status_and_payment(monkeypatch):
+    from datetime import datetime, timezone
+    import uuid
+
+    from bson import ObjectId
+    from app.modules.auth.security import get_current_vendor
+    import mongomock
+
+    mock_db = mongomock.MongoClient()["wavygo_test"]
+    mock_db["payments"].create_index(
+        [("tenant_id", 1), ("idempotency_key", 1)],
+        unique=True,
+        partialFilterExpression={"idempotency_key": {"$type": "string", "$gt": ""}},
+    )
+    mock_db["payments"].create_index(
+        [("tenant_id", 1), ("booking", 1), ("transaction_reference", 1)],
+        unique=True,
+        partialFilterExpression={"transaction_reference": {"$type": "string", "$gt": ""}},
+    )
+    monkeypatch.setattr("app.modules.payments.service.get_database", lambda: mock_db)
+    monkeypatch.setattr("app.modules.bookings.service.get_database", lambda: mock_db)
+    monkeypatch.setattr("app.modules.notifications.service.get_database", lambda: mock_db)
+
+    tenant_id = str(ObjectId())
+    booking_id = f"BK-TEST-{uuid.uuid4().hex[:8]}"
+    total_amount = 1899.0
+    now = datetime.now(timezone.utc).isoformat()
+    mock_db["bookings"].insert_one({
+        "id": booking_id,
+        "customer": "Pooja Verma",
+        "vehicle": "Royal Enfield Classic 350",
+        "dates": "Nov 05 – Nov 06",
+        "type": "Offline",
+        "status": "Active",
+        "paid": 0.0,
+        "pending": total_amount,
+        "base_amount": total_amount,
+        "add_on_amount": 0.0,
+        "service_fee": 0.0,
+        "discount_amount": 0.0,
+        "deposit_amount": 0.0,
+        "total_amount": total_amount,
+        "rental_days": 1,
+        "vehicle_details": {
+            "id": "VH-1038",
+            "name": "Royal Enfield Classic 350",
             "registration": "GJ 05 CD 7194",
-            "price_per_day": 1899,
+            "price_per_day": 1899.0,
         },
-        "customer": {
-            "name": "Pooja Verma",
-            "phone": "+91 91234 56789",
-            "aadhaar": "987654321098",
-            "driving_licence": "GJ0520207654321",
-        },
-        "rental": {
-            "start_date": "2026-11-05",
-            "end_date": "2026-11-06",
-            "pickup_location": "Adajan Center",
-            "add_ons": False,
-            "discount": 0,
-        },
-        "payment": {
-            "method": "UPI",
-            "deposit": False,
-            "paid_amount": 0,
-        },
-    }
-    create_res = client.post("/api/v1/bookings/offline", json=payload)
-    assert create_res.status_code == 201
-    booking_id = create_res.json()["id"]
-    total_amount = create_res.json()["total_amount"]
+        "customer_details": {"id": "CU-1", "name": "Pooja Verma", "phone": "+91 91234 56789"},
+        "rental_details": {"start_date": "2026-11-05", "end_date": "2026-11-06", "pickup_location": "Adajan Center"},
+        "payment_details": {"transactions": []},
+        "tenant_id": tenant_id,
+        "vendor_id": tenant_id,
+        "created_at": now,
+        "updated_at": now,
+    })
 
-    # Record partial payment
-    pay_res = client.post(
-        f"/api/v1/bookings/offline/{booking_id}/payments",
-        json={"amount": 500, "method": "UPI", "notes": "UPI reference 123456789"},
-    )
-    assert pay_res.status_code == 200
-    pay_data = pay_res.json()
-    assert pay_data["paid"] == 500.0
-    assert pay_data["pending"] == round(total_amount - 500.0, 2)
+    def authenticated_vendor():
+        return {"_id": ObjectId(tenant_id), "email": "booking-test@example.com", "is_active": True}
 
-    # Update status to Completed
-    patch_res = client.patch(
-        f"/api/v1/bookings/offline/{booking_id}",
-        json={"status": "Completed"},
-    )
-    assert patch_res.status_code == 200
-    assert patch_res.json()["status"] == "Completed"
+    app.dependency_overrides[get_current_vendor] = authenticated_vendor
+
+    try:
+        # Record partial payment
+        pay_res = client.post(
+            f"/api/v1/bookings/offline/{booking_id}/payments",
+            json={
+                "amount": 500,
+                "method": "UPI",
+                "notes": "UPI reference 123456789",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+        )
+        assert pay_res.status_code == 200
+        pay_data = pay_res.json()
+        assert pay_data["paid"] == 500.0
+        assert pay_data["pending"] == round(total_amount - 500.0, 2)
+
+        # Update status to Completed
+        patch_res = client.patch(
+            f"/api/v1/bookings/offline/{booking_id}",
+            json={"status": "Completed"},
+        )
+        assert patch_res.status_code == 409
+    finally:
+        app.dependency_overrides.pop(get_current_vendor, None)
 
 
 def test_booking_not_found():
@@ -200,7 +235,32 @@ def test_offline_booking_accepts_valid_aadhaar_with_optional_dl():
         )
 
 
-def test_offline_booking_bill_uses_consistent_two_decimal_rounding():
+def test_offline_booking_bill_uses_consistent_two_decimal_rounding(monkeypatch):
+    from bson import ObjectId
+    from app.modules.auth.security import get_current_vendor
+    import mongomock
+
+    mock_db = mongomock.MongoClient()["booking_rounding_test"]
+    mock_db["payments"].create_index(
+        [("tenant_id", 1), ("idempotency_key", 1)],
+        unique=True,
+        partialFilterExpression={"idempotency_key": {"$type": "string", "$gt": ""}},
+    )
+    mock_db["payments"].create_index(
+        [("tenant_id", 1), ("booking", 1), ("transaction_reference", 1)],
+        unique=True,
+        partialFilterExpression={"transaction_reference": {"$type": "string", "$gt": ""}},
+    )
+    tenant_id = str(ObjectId())
+    monkeypatch.setattr("app.modules.bookings.service.get_database", lambda: mock_db)
+    monkeypatch.setattr("app.modules.payments.service.get_database", lambda: mock_db)
+    monkeypatch.setattr("app.modules.notifications.service.get_database", lambda: mock_db)
+    monkeypatch.setattr("app.modules.bookings.router._get_tenant_id", lambda request: tenant_id)
+
+    def authenticated_vendor():
+        return {"_id": ObjectId(tenant_id), "email": "rounding-test@example.com", "is_active": True}
+
+    app.dependency_overrides[get_current_vendor] = authenticated_vendor
     payload = _offline_booking_payload()
     payload["vehicle"]["price_per_day"] = 649.99
     payload["rental"]["start_date"] = "2026-11-20"
@@ -210,12 +270,18 @@ def test_offline_booking_bill_uses_consistent_two_decimal_rounding():
     payload["payment"]["paid_amount"] = 50.555
     payload["payment"]["deposit"] = False
 
-    response = client.post("/api/v1/bookings/offline", json=payload)
-    assert response.status_code == 201
-    data = response.json()
-    assert data["base_amount"] == 649.99
-    assert data["service_fee"] == 32.5
-    assert data["discount_amount"] == 10.01
-    assert data["total_amount"] == 672.48
-    assert data["paid"] == 50.56
-    assert data["pending"] == 621.92
+    try:
+        response = client.post("/api/v1/bookings/offline", json=payload)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["base_amount"] == 649.99
+        assert data["service_fee"] == 32.5
+        assert data["discount_amount"] == 10.01
+        assert data["total_amount"] == 672.48
+        # The booking service rounds the requested 50.555 advance to ₹50.56,
+        # then records that rounded amount through the payment service.
+        assert data["paid"] == 50.56
+        assert data["pending"] == 621.92
+        assert mock_db["payments"].find_one({"booking": data["id"], "amount": 50.56}) is not None
+    finally:
+        app.dependency_overrides.pop(get_current_vendor, None)

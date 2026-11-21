@@ -2,21 +2,27 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, date, timezone
+from datetime import datetime, date, time as datetime_time, timezone, timedelta
 import time
 import uuid
 from typing import Optional, List, Dict, Any
 from bson import ObjectId
+from fastapi import HTTPException, status
+from pymongo import ReturnDocument
 
 from app.db.mongodb import get_database
 from app.modules.bookings.schemas import (
     OfflineBookingCreate,
     OfflineBookingUpdate,
     PaymentRecordCreate,
+    LifecycleActionRequest,
+    ReturnBookingRequest,
     OfflineBookingResponse,
 )
 
 logger = logging.getLogger(__name__)
+
+LATE_GRACE_MINUTES = 0
 
 
 class BookingService:
@@ -55,6 +61,27 @@ class BookingService:
     def _round_money(amount: float) -> float:
         return round(float(amount) + 1e-9, 2)
 
+    @staticmethod
+    def _enrich_booking_payment_fields(doc: dict[str, Any]) -> dict[str, Any]:
+        total = float(doc.get("total_amount", 0.0))
+        paid = float(doc.get("paid", 0.0))
+        total_paise = int(round(total * 100))
+        paid_paise = int(round(paid * 100))
+        outstanding_paise = max(0, total_paise - paid_paise)
+        outstanding = round(outstanding_paise / 100.0, 2)
+
+        if paid_paise == 0:
+            p_status = "Unpaid"
+        elif paid_paise < total_paise:
+            p_status = "Partially Paid"
+        else:
+            p_status = "Paid"
+
+        doc["outstanding"] = outstanding
+        doc["payment_status"] = p_status
+        doc["pending"] = outstanding
+        return doc
+
     def create_offline_booking(self, payload: OfflineBookingCreate, tenant_id: Optional[str] = None) -> OfflineBookingResponse:
         now_dt = datetime.now(timezone.utc)
         now_str = now_dt.isoformat()
@@ -73,8 +100,15 @@ class BookingService:
         deposit_amount = self._round_money(2000.0 if payload.payment.deposit else 0.0)
         total_amount = self._round_money(subtotal - discount_amount + deposit_amount)
 
-        initial_paid = self._round_money(min(total_amount, float(payload.payment.paid_amount)))
-        pending_amount = self._round_money(max(0.0, total_amount - initial_paid))
+        requested_advance = self._round_money(min(total_amount, float(payload.payment.paid_amount)))
+        if requested_advance > 0 and not tenant_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication is required to record an advance payment.")
+        if requested_advance > 0 and payload.payment.method.strip().lower() != "cash" and not (payload.payment.transaction_reference or "").strip():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Transaction reference is required for a non-Cash advance payment.")
+        if requested_advance > 0 and self._get_db() is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable. Cannot record advance payment.")
+        initial_paid = 0.0
+        pending_amount = total_amount
         
         dates_formatted = self._format_date_range(payload.rental.start_date, payload.rental.end_date)
         
@@ -110,16 +144,8 @@ class BookingService:
             "method": payload.payment.method,
             "deposit_required": payload.payment.deposit,
             "deposit_amount": deposit_amount,
-            "initial_paid": initial_paid,
-            "transactions": [
-                {
-                    "id": f"TX-{uuid.uuid4().hex[:6].upper()}",
-                    "amount": initial_paid,
-                    "method": payload.payment.method,
-                    "date": now_str,
-                    "type": "Initial Payment",
-                }
-            ] if initial_paid > 0 else [],
+            "initial_paid": 0.0,
+            "transactions": [],
         }
         
         record: dict[str, Any] = {
@@ -128,7 +154,7 @@ class BookingService:
             "vehicle": payload.vehicle.vehicle_name,
             "dates": dates_formatted,
             "type": "Offline",
-            "status": "Active",
+            "status": "Confirmed",
             "paid": initial_paid,
             "pending": pending_amount,
             "base_amount": base_amount,
@@ -137,6 +163,7 @@ class BookingService:
             "discount_amount": discount_amount,
             "deposit_amount": deposit_amount,
             "total_amount": total_amount,
+            "finalTotalAmount": total_amount,
             "rental_days": rental_days,
             "vehicle_details": vehicle_details,
             "customer_details": customer_details,
@@ -153,23 +180,6 @@ class BookingService:
         
         # Save to Mongo if available, else save to memory store
         db = self._get_db()
-
-        # Mark vehicle as Rented upon booking creation
-        v_ident = payload.vehicle.vehicle_id or payload.vehicle.vehicle_name
-        if v_ident and db is not None:
-            try:
-                conds: list[dict[str, Any]] = [{"id": v_ident}, {"_id": v_ident}, {"makeModel": v_ident}, {"name": v_ident}]
-                try:
-                    if ObjectId.is_valid(v_ident):
-                        conds.append({"_id": ObjectId(v_ident)})
-                except Exception:
-                    pass
-                db["vehicles"].update_many(
-                    {"$or": conds},
-                    {"$set": {"fleetAvailability": "Rented", "availability": "Rented", "updatedAt": now_str}},
-                )
-            except Exception:
-                pass
 
         # Save to Mongo if available, else save to memory store
         if db is not None:
@@ -225,8 +235,8 @@ class BookingService:
                     update_ops: dict[str, Any] = {
                         "$inc": {
                             "bookings": 1,
-                            "active": 1,
-                            "paid": float(initial_paid),
+                            "active": 0,
+                            "paid": 0.0,
                             "pending": float(pending_amount),
                         },
                         "$set": {
@@ -250,8 +260,8 @@ class BookingService:
                         "driving_licence_number": driving_licence_number,
                         "status": "Verified",
                         "bookings": 1,
-                        "active": 1,
-                        "paid": float(initial_paid),
+                        "active": 0,
+                        "paid": 0.0,
                         "pending": float(pending_amount),
                         "created_at": now_utc,
                         "updated_at": now_utc,
@@ -268,8 +278,8 @@ class BookingService:
             from app.modules.notifications.service import create_notification
             b_tenant = tenant_id or getattr(payload, "tenant_id", None)
             create_notification(
-                title="Vehicle Rented (New Booking)",
-                message=f"{payload.vehicle.vehicle_name} is now Rented for booking {booking_id} by {payload.customer.name}.",
+                title="Booking Confirmed",
+                message=f"Booking {booking_id} confirmed for {payload.customer.name}.",
                 notification_type="booking",
                 severity="success",
                 entity_id=booking_id,
@@ -280,7 +290,34 @@ class BookingService:
             pass
         
         self._memory_bookings[booking_id] = record
-        return OfflineBookingResponse.model_validate(record)
+        if requested_advance > 0:
+            try:
+                from app.modules.payments.schemas import PaymentCreate
+                from app.modules.payments.service import payment_service
+                payment_service.record_payment(
+                    PaymentCreate(
+                        booking_id=booking_id,
+                        amount=requested_advance,
+                        method=payload.payment.method,
+                        transaction_reference=(payload.payment.transaction_reference or "").strip() or None,
+                        idempotency_key=f"advance-{booking_id}",
+                    ),
+                    tenant_id=tenant_id,
+                )
+                if db is not None:
+                    saved = db["bookings"].find_one({"id": booking_id})
+                    if saved:
+                        saved.pop("_id", None)
+                        record = saved
+            except HTTPException as exc:
+                record["advancePaymentError"] = exc.detail
+                if db is not None:
+                    db["bookings"].update_one({"id": booking_id}, {"$set": {"advancePaymentError": exc.detail}})
+            except Exception:
+                record["advancePaymentError"] = "Advance payment could not be recorded."
+                if db is not None:
+                    db["bookings"].update_one({"id": booking_id}, {"$set": {"advancePaymentError": record["advancePaymentError"]}})
+        return OfflineBookingResponse.model_validate(self._enrich_booking_payment_fields(record))
 
     def get_booking(self, booking_id: str, tenant_id: Optional[str] = None) -> Optional[OfflineBookingResponse]:
         db = self._get_db()
@@ -298,7 +335,7 @@ class BookingService:
                 if doc:
                     doc["id"] = doc.get("id") or str(doc.get("_id"))
                     doc.pop("_id", None)
-                    return OfflineBookingResponse.model_validate(doc)
+                    return OfflineBookingResponse.model_validate(self._enrich_booking_payment_fields(doc))
             except Exception as exc:
                 logger.error("Failed to get booking from Mongo: %s", exc)
 
@@ -306,7 +343,7 @@ class BookingService:
             b = self._memory_bookings[booking_id]
             if tenant_id and b.get("tenant_id") and b.get("tenant_id") != tenant_id:
                 return None
-            return OfflineBookingResponse.model_validate(b)
+            return OfflineBookingResponse.model_validate(self._enrich_booking_payment_fields(b))
         return None
 
     def list_bookings(
@@ -366,7 +403,7 @@ class BookingService:
                 results.append(b)
             results = results[skip: skip + limit]
 
-        return [OfflineBookingResponse.model_validate(item) for item in results]
+        return [OfflineBookingResponse.model_validate(self._enrich_booking_payment_fields(item)) for item in results]
 
     def update_booking(self, booking_id: str, payload: OfflineBookingUpdate, tenant_id: Optional[str] = None) -> Optional[OfflineBookingResponse]:
         booking = self.get_booking(booking_id, tenant_id=tenant_id)
@@ -478,88 +515,180 @@ class BookingService:
 
         return self.get_booking(booking_id)
 
-    def record_payment(self, booking_id: str, payment: PaymentRecordCreate, tenant_id: Optional[str] = None) -> Optional[OfflineBookingResponse]:
-        booking = self.get_booking(booking_id, tenant_id=tenant_id)
-        if not booking:
-            return None
-
-        new_paid = booking.paid + payment.amount
-        new_pending = max(0.0, booking.total_amount - new_paid)
-        now_str = datetime.now(timezone.utc).isoformat()
-
-        tx = {
-            "id": f"TX-{uuid.uuid4().hex[:6].upper()}",
-            "amount": payment.amount,
-            "method": payment.method,
-            "notes": payment.notes,
-            "date": now_str,
-            "type": "Partial / Full Payment",
+    @staticmethod
+    def _tenant_filter(booking_id: str, tenant_id: str, expected_status: str | list[str]) -> dict[str, Any]:
+        statuses = expected_status if isinstance(expected_status, list) else [expected_status]
+        return {
+            "$and": [
+                {"$or": [{"id": booking_id}, {"_id": booking_id}]},
+                {"$or": [{"tenant_id": tenant_id}, {"vendor_id": tenant_id}]},
+                {"status": {"$in": statuses}},
+            ]
         }
 
-        # Update in Mongo first
+    @staticmethod
+    def _ownership_filter(booking_id: str, tenant_id: str) -> dict[str, Any]:
+        return {"$and": [{"$or": [{"id": booking_id}, {"_id": booking_id}]}, {"$or": [{"tenant_id": tenant_id}, {"vendor_id": tenant_id}]}]}
+
+    @staticmethod
+    def _vehicle_filter(booking: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+        details = booking.get("vehicle_details") or {}
+        vehicle_id = str(details.get("id") or booking.get("vehicle") or "")
+        registration = str(details.get("registration") or "")
+        refs: list[dict[str, Any]] = [{"id": vehicle_id}, {"_id": vehicle_id}, {"makeModel": vehicle_id}, {"name": vehicle_id}]
+        if registration:
+            refs.extend([{"registration": registration}, {"registrationNumber": registration}])
+        if ObjectId.is_valid(vehicle_id):
+            refs.append({"_id": ObjectId(vehicle_id)})
+        return {"$and": [{"$or": refs}, {"$or": [{"tenantId": tenant_id}, {"tenant_id": tenant_id}, {"vendor_id": tenant_id}]}]}
+
+    @staticmethod
+    def _action_time(value: Optional[datetime]) -> datetime:
+        action_time = value or datetime.now(timezone.utc)
+        if action_time.tzinfo is None:
+            action_time = action_time.replace(tzinfo=timezone.utc)
+        action_time = action_time.astimezone(timezone.utc)
+        if action_time > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise HTTPException(status_code=422, detail="Lifecycle timestamp cannot be in the future.")
+        return action_time
+
+    def _response_from_doc(self, doc: dict[str, Any]) -> OfflineBookingResponse:
+        doc = dict(doc)
+        doc.pop("_id", None)
+        additional = sum(int(round(float(item.get("amount", 0)) * 100)) for item in doc.get("additionalCharges", []))
+        total = self._round_money(float(doc.get("total_amount", 0.0)))
+        paid = self._round_money(float(doc.get("paid", 0.0)))
+        doc["finalTotalAmount"] = total
+        doc["finalBill"] = {
+            "base": doc.get("base_amount", 0.0), "discount": doc.get("discount_amount", 0.0),
+            "deposit": doc.get("deposit_amount", 0.0), "additionalCharges": self._round_money(additional / 100),
+            "finalTotal": total, "paid": paid, "outstanding": self._round_money(max(0, total - paid)),
+        }
+        return OfflineBookingResponse.model_validate(self._enrich_booking_payment_fields(doc))
+
+    def handover_booking(self, booking_id: str, payload: LifecycleActionRequest, tenant_id: str) -> OfflineBookingResponse:
         db = self._get_db()
-        if db is not None:
-            try:
-                db["bookings"].update_one(
-                    {"$or": [{"id": booking_id}, {"_id": booking_id}]},
-                    {
-                        "$set": {"paid": new_paid, "pending": new_pending, "updated_at": now_str},
-                        "$push": {"payment_details.transactions": tx},
-                    },
-                )
-            except Exception as exc:
-                logger.error("Failed to update booking in Mongo: %s", exc)
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database unavailable.")
+        if not db["bookings"].find_one(self._ownership_filter(booking_id, tenant_id)):
+            raise HTTPException(status_code=404, detail="Booking not found.")
+        booking = db["bookings"].find_one(self._tenant_filter(booking_id, tenant_id, "Confirmed"))
+        if not booking:
+            raise HTTPException(status_code=409, detail="Handover requires a Confirmed booking.")
+        vehicle_id = (booking.get("vehicle_details") or {}).get("id") or booking.get("vehicle")
+        other = db["bookings"].find_one({"$and": [{"$or": [{"tenant_id": tenant_id}, {"vendor_id": tenant_id}]}, {"status": {"$in": ["Active", "Returned"]}}, {"id": {"$ne": booking_id}}, {"$or": [{"vehicle_details.id": vehicle_id}, {"vehicle": booking.get("vehicle")}]}]})
+        if other:
+            raise HTTPException(status_code=409, detail="Vehicle is already held by another active booking.")
+        now = self._action_time(payload.occurred_at).isoformat()
+        claim_filter = {"$and": [self._vehicle_filter(booking, tenant_id), {"$or": [{"fleetAvailability": "Available"}, {"availability": "Available"}, {"fleetAvailability": {"$exists": False}}, {"availability": {"$exists": False}}]}]}
+        claimed = db["vehicles"].find_one_and_update(claim_filter, {"$set": {"fleetAvailability": "Rented", "availability": "Rented", "updatedAt": now}}, return_document=ReturnDocument.AFTER)
+        if not claimed:
+            raise HTTPException(status_code=409, detail="Vehicle is not available for handover.")
+        updated = db["bookings"].find_one_and_update(self._tenant_filter(booking_id, tenant_id, "Confirmed"), {"$set": {"status": "Active", "handoverAt": now, "handoverNotes": payload.notes, "updated_at": now}}, return_document=ReturnDocument.AFTER)
+        if not updated:
+            db["vehicles"].update_one({"_id": claimed["_id"], "fleetAvailability": "Rented"}, {"$set": {"fleetAvailability": "Available", "availability": "Available", "updatedAt": now}})
+            raise HTTPException(status_code=409, detail="Booking is no longer Confirmed; handover was not applied.")
+        return self._response_from_doc(updated)
 
-        # Update customer paid and pending metrics in Mongo
-        if db is not None:
-            try:
-                c_id = (
-                    booking.customer_details.get("id")
-                    if isinstance(booking.customer_details, dict)
-                    else getattr(booking.customer_details, "id", None)
-                ) if booking.customer_details else None
-                c_cond: dict[str, Any] = {}
-                if c_id and ObjectId.is_valid(c_id):
-                    c_cond["_id"] = ObjectId(c_id)
-                elif booking.customer:
-                    c_cond["name"] = booking.customer
-                if c_cond:
-                    db["customers"].update_one(
-                        c_cond,
-                        {
-                            "$inc": {"paid": float(payment.amount), "pending": -float(payment.amount)},
-                            "$set": {"updated_at": datetime.now(timezone.utc)},
-                        },
-                    )
-            except Exception:
-                pass
-        if booking_id in self._memory_bookings:
-            mem = self._memory_bookings[booking_id]
-            mem["paid"] = new_paid
-            mem["pending"] = new_pending
-            mem["updated_at"] = now_str
-            if "payment_details" not in mem:
-                mem["payment_details"] = {}
-            if "transactions" not in mem["payment_details"]:
-                mem["payment_details"]["transactions"] = []
-            mem["payment_details"]["transactions"].append(tx)
-
+    def return_booking(self, booking_id: str, payload: ReturnBookingRequest, tenant_id: str) -> OfflineBookingResponse:
+        db = self._get_db()
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database unavailable.")
+        if not db["bookings"].find_one(self._ownership_filter(booking_id, tenant_id)):
+            raise HTTPException(status_code=404, detail="Booking not found.")
+        booking = db["bookings"].find_one(self._tenant_filter(booking_id, tenant_id, "Active"))
+        if not booking:
+            raise HTTPException(status_code=409, detail="Return requires an Active booking.")
+        returned = self._action_time(payload.occurred_at)
+        if booking.get("handoverAt"):
+            handover = datetime.fromisoformat(str(booking["handoverAt"]).replace("Z", "+00:00"))
+            if returned < handover.astimezone(timezone.utc):
+                raise HTTPException(status_code=422, detail="Return time cannot be before handover time.")
+        rental = booking.get("rental_details") or {}
+        late_paise = 0
         try:
-            from app.modules.notifications.service import create_notification
-            b_tenant = tenant_id or getattr(booking, "tenant_id", None) or getattr(booking, "vendor_id", None)
-            create_notification(
-                title="Payment Received",
-                message=f"Payment of ₹{payment.amount} recorded for booking {booking_id} via {payment.method}.",
-                notification_type="payment",
-                severity="success",
-                entity_id=booking_id,
-                entity_type="booking",
-                tenant_id=str(b_tenant) if b_tenant else None,
-            )
+            due = datetime.combine(date.fromisoformat(rental["end_date"]), datetime_time.fromisoformat(rental.get("return_time") or "10:00"), tzinfo=timezone(timedelta(hours=5, minutes=30))) + timedelta(minutes=LATE_GRACE_MINUTES)
+            returned_ist = returned.astimezone(timezone(timedelta(hours=5, minutes=30)))
+            late_seconds = (returned_ist - due).total_seconds()
+            if late_seconds > 0:
+                late_days = max(1, int((late_seconds + 86399) // 86400))
+                late_paise = late_days * int(round(float((booking.get("vehicle_details") or {}).get("price_per_day", 0)) * 100))
         except Exception:
-            pass
+            late_paise = 0
+        manual_paise = int(round(float(payload.extra_charges) * 100))
+        if manual_paise and not (payload.extra_charge_reason or "").strip():
+            raise HTTPException(status_code=422, detail="A reason is required for manual extra charges.")
+        charge_items: list[dict[str, Any]] = []
+        stamp = returned.isoformat()
+        if late_paise:
+            charge_items.append({"amount": self._round_money(late_paise / 100), "reason": "Late return", "type": "late", "createdAt": stamp})
+        if manual_paise:
+            charge_items.append({"amount": self._round_money(manual_paise / 100), "reason": payload.extra_charge_reason.strip(), "type": "manual", "createdAt": stamp})
+        added = self._round_money((late_paise + manual_paise) / 100)
+        update: dict[str, Any] = {"$set": {"status": "Returned", "returnedAt": stamp, "returnNotes": payload.notes, "updated_at": stamp, "finalBill": {}}, "$inc": {"total_amount": added, "pending": added, "finalTotalAmount": added}}
+        if charge_items:
+            update["$push"] = {"additionalCharges": {"$each": charge_items}}
+        updated = db["bookings"].find_one_and_update(self._tenant_filter(booking_id, tenant_id, "Active"), update, return_document=ReturnDocument.AFTER)
+        if not updated:
+            raise HTTPException(status_code=409, detail="Booking is no longer Active; return was not applied.")
+        db["vehicles"].update_one(self._vehicle_filter(booking, tenant_id), {"$set": {"fleetAvailability": "Under Review", "availability": "Under Review", "updatedAt": stamp}})
+        if added:
+            customer_id = (booking.get("customer_details") or {}).get("id")
+            customer_filter: dict[str, Any] = {"name": booking.get("customer"), "$or": [{"tenant_id": tenant_id}, {"tenant_id": ObjectId(tenant_id) if ObjectId.is_valid(tenant_id) else tenant_id}]}
+            if customer_id and ObjectId.is_valid(customer_id):
+                customer_filter = {"_id": ObjectId(customer_id)}
+            db["customers"].update_one(customer_filter, {"$inc": {"pending": added}, "$set": {"updated_at": datetime.now(timezone.utc)}})
+        return self._response_from_doc(updated)
 
-        return self.get_booking(booking_id)
+    def complete_booking(self, booking_id: str, payload: LifecycleActionRequest, tenant_id: str) -> OfflineBookingResponse:
+        db = self._get_db()
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database unavailable.")
+        if not db["bookings"].find_one(self._ownership_filter(booking_id, tenant_id)):
+            raise HTTPException(status_code=404, detail="Booking not found.")
+        stamp = self._action_time(payload.occurred_at).isoformat()
+        updated = db["bookings"].find_one_and_update(self._tenant_filter(booking_id, tenant_id, "Returned"), {"$set": {"status": "Completed", "completedAt": stamp, "updated_at": stamp}}, return_document=ReturnDocument.AFTER)
+        if not updated:
+            raise HTTPException(status_code=409, detail="Completion requires a Returned booking.")
+        vehicle_filter = self._vehicle_filter(updated, tenant_id)
+        vehicle_id = (updated.get("vehicle_details") or {}).get("id") or updated.get("vehicle")
+        holder = db["bookings"].find_one({"$and": [{"$or": [{"tenant_id": tenant_id}, {"vendor_id": tenant_id}]}, {"status": {"$in": ["Active", "Returned"]}}, {"id": {"$ne": booking_id}}, {"$or": [{"vehicle_details.id": vehicle_id}, {"vehicle": updated.get("vehicle")}]}]})
+        if not holder:
+            db["vehicles"].update_one(vehicle_filter, {"$set": {"fleetAvailability": "Available", "availability": "Available", "updatedAt": stamp}})
+        return self._response_from_doc(updated)
+
+    def cancel_booking(self, booking_id: str, tenant_id: str) -> OfflineBookingResponse:
+        db = self._get_db()
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database unavailable.")
+        if not db["bookings"].find_one(self._ownership_filter(booking_id, tenant_id)):
+            raise HTTPException(status_code=404, detail="Booking not found.")
+        stamp = datetime.now(timezone.utc).isoformat()
+        updated = db["bookings"].find_one_and_update(self._tenant_filter(booking_id, tenant_id, ["Confirmed", "Active"]), {"$set": {"status": "Cancelled", "updated_at": stamp}}, return_document=ReturnDocument.AFTER)
+        if not updated:
+            raise HTTPException(status_code=409, detail="Cancellation is allowed only from Confirmed or Active.")
+        return self._response_from_doc(updated)
+
+    def record_payment(self, booking_id: str, payment: PaymentRecordCreate, tenant_id: Optional[str] = None) -> Optional[OfflineBookingResponse]:
+        from app.modules.payments.service import payment_service
+        from app.modules.payments.schemas import PaymentCreate
+
+        idemp_key = payment.idempotency_key or str(uuid.uuid4())
+        ref = payment.transaction_reference
+        if payment.method.strip().lower() != "cash" and not ref:
+            ref = f"REF-{uuid.uuid4().hex[:6].upper()}"
+
+        p_create = PaymentCreate(
+            booking_id=booking_id,
+            amount=payment.amount,
+            method=payment.method,
+            notes=payment.notes,
+            transaction_reference=ref,
+            idempotency_key=idemp_key,
+            payment_date=payment.payment_date,
+        )
+        payment_service.record_payment(p_create, tenant_id=tenant_id)
+        return self.get_booking(booking_id, tenant_id=tenant_id)
 
 
 booking_service = BookingService()

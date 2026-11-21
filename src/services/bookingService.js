@@ -66,16 +66,45 @@ export const bookingService = {
     })
   },
 
+  async handoverOfflineBooking(bookingId, { occurredAt, notes } = {}) {
+    return apiFetch(`/bookings/offline/${encodeURIComponent(bookingId)}/handover`, {
+      method: 'POST',
+      body: JSON.stringify({ occurred_at: occurredAt, notes }),
+    })
+  },
+
+  async returnOfflineBooking(bookingId, { occurredAt, notes, extraCharges = 0, extraChargeReason } = {}) {
+    return apiFetch(`/bookings/offline/${encodeURIComponent(bookingId)}/return`, {
+      method: 'POST',
+      body: JSON.stringify({
+        occurred_at: occurredAt,
+        notes,
+        extra_charges: Number(extraCharges) || 0,
+        extra_charge_reason: extraChargeReason || undefined,
+      }),
+    })
+  },
+
+  async completeOfflineBooking(bookingId, { occurredAt, notes } = {}) {
+    return apiFetch(`/bookings/offline/${encodeURIComponent(bookingId)}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ occurred_at: occurredAt, notes }),
+    })
+  },
+
   /**
    * Record a payment against an offline booking
    */
-  async recordPayment(bookingId, { amount, method = 'Cash', notes }) {
+  async recordPayment(bookingId, { amount, method = 'Cash', notes, transaction_reference, idempotency_key, payment_date }) {
     return apiFetch(`/bookings/offline/${encodeURIComponent(bookingId)}/payments`, {
       method: 'POST',
       body: JSON.stringify({
         amount: Number(amount),
         method,
         notes,
+        transaction_reference,
+        idempotency_key: idempotency_key || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `idemp-${Date.now()}`),
+        payment_date,
       }),
     })
   },

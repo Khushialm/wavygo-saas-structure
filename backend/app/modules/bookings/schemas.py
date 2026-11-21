@@ -48,6 +48,7 @@ class PaymentInput(BaseModel):
     method: str = Field("Cash", description="Payment method: Cash, UPI, Card, Net Banking")
     deposit: bool = Field(False, description="Whether security deposit is taken (+2000)")
     paid_amount: float = Field(0.0, ge=0, description="Initial amount paid at the counter")
+    transaction_reference: Optional[str] = Field(None, description="UPI/UTR/Card reference for an advance")
 
 
 class OfflineBookingCreate(BaseModel):
@@ -69,6 +70,19 @@ class PaymentRecordCreate(BaseModel):
     amount: float = Field(..., gt=0, description="Payment amount collected in INR")
     method: str = Field("Cash", description="Payment method: Cash, UPI, Card")
     notes: Optional[str] = Field(None, description="Payment note or transaction ID")
+    transaction_reference: Optional[str] = Field(None, description="UPI/UTR/Card reference")
+    idempotency_key: Optional[str] = Field(None, description="Unique client UUID for idempotency")
+    payment_date: Optional[str] = Field(None, description="Payment date")
+
+
+class LifecycleActionRequest(BaseModel):
+    occurred_at: Optional[datetime] = Field(None, description="UTC action time; defaults to server time")
+    notes: Optional[str] = Field(None, max_length=1000)
+
+
+class ReturnBookingRequest(LifecycleActionRequest):
+    extra_charges: float = Field(0.0, ge=0)
+    extra_charge_reason: Optional[str] = Field(None, max_length=500)
 
 
 class OfflineBookingResponse(BaseModel):
@@ -80,6 +94,8 @@ class OfflineBookingResponse(BaseModel):
     status: str
     paid: float
     pending: float
+    outstanding: float = 0.0
+    payment_status: str = "Unpaid"
     base_amount: float
     add_on_amount: float
     service_fee: float
@@ -94,3 +110,12 @@ class OfflineBookingResponse(BaseModel):
     notes: Optional[str] = None
     created_at: str
     updated_at: str
+    handoverAt: Optional[str] = None
+    returnedAt: Optional[str] = None
+    completedAt: Optional[str] = None
+    handoverNotes: Optional[str] = None
+    returnNotes: Optional[str] = None
+    additionalCharges: list[dict] = Field(default_factory=list)
+    finalTotalAmount: Optional[float] = None
+    finalBill: Optional[dict] = None
+    advancePaymentError: Optional[str] = None
